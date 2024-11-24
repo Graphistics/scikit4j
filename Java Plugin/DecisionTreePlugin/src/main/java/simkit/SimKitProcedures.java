@@ -1,4 +1,6 @@
 package simkit;
+import java.io.BufferedReader;
+import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.text.DecimalFormat;
@@ -11,19 +13,12 @@ import java.util.stream.Collectors;
 
 import org.apache.commons.math3.linear.RealMatrix;
 import org.ejml.simple.SimpleMatrix;
-import org.neo4j.driver.AuthTokens;
-import org.neo4j.driver.Driver;
-import org.neo4j.driver.GraphDatabase;
-import org.neo4j.driver.Record;
-import org.neo4j.driver.Result;
-import org.neo4j.driver.Session;
-import org.neo4j.driver.Transaction;
-import org.neo4j.driver.TransactionWork;
-import org.neo4j.driver.Value;
+import org.neo4j.driver.*;
 import org.neo4j.driver.exceptions.AuthenticationException;
 import org.neo4j.driver.exceptions.Neo4jException;
 import org.neo4j.driver.exceptions.ServiceUnavailableException;
 import org.neo4j.driver.util.Pair;
+import org.neo4j.graphdb.RelationshipType;
 import org.neo4j.logging.Log;
 import org.neo4j.procedure.Context;
 import org.neo4j.procedure.Description;
@@ -129,6 +124,109 @@ public class SimKitProcedures implements AutoCloseable{
 	{
 		driver.close();
 	}
+
+	@UserFunction
+	public String createGraphCora(@Name("data_path_nodes") String data_path_nodes,@Name("data_path_edges") String data_path_edges,@Name("label") String node_label) {
+
+		try ( SimKitProcedures connector = new SimKitProcedures(SimKitProcedures.uri, SimKitProcedures.username, SimKitProcedures.password) )
+		{
+            try (Session session = connector.getDriver().session()) {
+                if (data_path_nodes == null || data_path_edges == null) {
+                    throw new Exception("Missing dataPath");
+                }
+                try (BufferedReader br = new BufferedReader(new FileReader(data_path_nodes))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        String[] parts = line.split("\\s+");
+						String coraId = parts[0];
+                        double[] features = Arrays.stream(Arrays.copyOfRange(parts, 1, parts.length - 1))
+                                .mapToDouble(Double::parseDouble)
+                                .toArray();
+                        String label = parts[parts.length - 1];
+
+						session.run("CREATE (n:" + node_label + " {cora_id: $cora_id, features: $features, label: $label})",
+								Values.parameters("cora_id", coraId, "features", features, "label", label));
+                    }
+                } catch (IOException e) {
+                    System.err.println("Error reading node features file: " + e.getMessage());
+                }
+				System.out.println("node creation done");
+				try (BufferedReader br = new BufferedReader(new FileReader(data_path_edges))) {
+					String line;
+					while ((line = br.readLine()) != null) {
+						String[] parts = line.split("\\s+");
+						String sourceId = parts[0];
+						String targetId = parts[1];
+						System.out.println(sourceId +"  "+targetId);
+
+						session.run(
+								"MATCH (source:" + node_label + " {cora_id: $source_id}), (target:" + node_label + " {cora_id: $target_id}) " +
+										"CREATE (source)-[:CITES {value: 1}]->(target)",
+								Values.parameters("source_id", sourceId, "target_id", targetId));
+					}
+				} catch (IOException e) {
+					System.err.println("Error reading edges file: " + e.getMessage());
+				}
+            }
+
+        }  catch (Exception e) {
+			throw new RuntimeException(e);
+		}
+
+		return "created graph from nodes and edge list";
+	}
+
+	@UserFunction
+	public String graphToSimilarityMatrix(@Name("label") String node_label) throws Exception {
+		double[][] similarityMatrix;
+		try ( SimKitProcedures connector = new SimKitProcedures(SimKitProcedures.uri, SimKitProcedures.username, SimKitProcedures.password) ){
+			try (Session session = connector.getDriver().session()) {
+				String query = String.join(" ",
+						"MATCH (a:" + node_label + "), (b:" + node_label + ")",
+						"WHERE id(a) < id(b)",
+						"RETURN a.cora_id AS source, b.cora_id AS target,",
+						"CASE",
+						"  WHEN shortestPath((a)-[*]-(b)) IS NOT NULL",
+						"  THEN 1.0 / (1 + length(shortestPath((a)-[*]-(b))))",
+						"  ELSE 0",
+						"END AS similarity"
+				);
+
+
+				List<String> nodeIds = session.run(
+						"MATCH (n:" + node_label + ") RETURN n.cora_id AS id ORDER BY id"
+				).list(record -> record.get("id").asString());
+				int n = nodeIds.size();
+
+
+				Map<String, Integer> nodeIndexMap = new HashMap<>();
+				for (int i = 0; i < n; i++) {
+					nodeIndexMap.put(nodeIds.get(i), i);
+				}
+
+
+				similarityMatrix = new double[n][n];
+
+
+				session.run(query).list().forEach(record -> {
+					String source = record.get("source").asString();
+					String target = record.get("target").asString();
+					double similarity = record.get("similarity").asDouble();
+
+					int sourceIndex = nodeIndexMap.get(source);
+					int targetIndex = nodeIndexMap.get(target);
+
+					similarityMatrix[sourceIndex][targetIndex] = similarity;
+					similarityMatrix[targetIndex][sourceIndex] = similarity; // Symmetric
+				});
+			}
+
+
+		}
+		return "similarity matrix based on shortest path : " + Arrays.deepToString(similarityMatrix);
+	}
+
+
 
 	@UserFunction
 	public String csvToGraph(@Name("data_path") String data_path, @Name("distance_measure") String distance_measure, @Name("graph_type") String graph_type, @Name("parameter") String parameter,@Name("remove_column") String remove_columns) throws Exception {
